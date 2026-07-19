@@ -98,6 +98,18 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+EXTERNAL_PRESENTATION_TO_OPERATIONAL = {
+    "triage": "triage",
+    "todo": "todo",
+    "scheduled": "scheduled",
+    "ready": "ready",
+    "in-progress": "ready",
+    "running": "ready",
+    "review": "review",
+    "blocked": "blocked",
+    "done": "done",
+    "archived": "archived",
+}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -777,6 +789,8 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Source-of-truth presentation state. This never proves worker ownership.
+    external_status: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -851,6 +865,9 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            external_status=(
+                row["external_status"] if "external_status" in keys else None
             ),
         )
 
@@ -942,6 +959,14 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class ExternalTaskSyncResult:
+    created: bool
+    changed: bool
+    operational_status: str
+    presentation_status: str
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1013,7 +1038,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Source-of-truth presentation state, separate from worker execution.
+    external_status      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1669,6 +1696,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "external_status" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "external_status", "external_status TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -1726,7 +1758,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
                 "FROM tasks "
-                "WHERE status = 'running' AND current_run_id IS NULL"
+                "WHERE status = 'running' AND current_run_id IS NULL "
+                "  AND (claim_lock IS NOT NULL OR worker_pid IS NOT NULL)"
             ).fetchall()
             for row in inflight:
                 started = row["started_at"] or int(time.time())
@@ -2812,6 +2845,39 @@ def _synthesize_ended_run(
     return int(cur.lastrowid or 0)
 
 
+def _supersede_other_open_runs(
+    conn: sqlite3.Connection,
+    task_id: str,
+    authoritative_run_id: Optional[int],
+    *,
+    ended_at: Optional[int] = None,
+) -> int:
+    """Close every non-authoritative open run during terminal reconciliation."""
+    now = int(time.time()) if ended_at is None else int(ended_at)
+    if authoritative_run_id is None:
+        predicate = ""
+        params: tuple[Any, ...] = (now, task_id)
+    else:
+        predicate = " AND id != ?"
+        params = (now, task_id, int(authoritative_run_id))
+    cur = conn.execute(
+        """
+        UPDATE task_runs
+           SET status = 'superseded',
+               outcome = 'superseded_terminal',
+               summary = COALESCE(summary, 'superseded by terminal task transition'),
+               ended_at = ?,
+               claim_lock = NULL,
+               claim_expires = NULL,
+               worker_pid = NULL
+         WHERE task_id = ?
+           AND ended_at IS NULL
+        """ + predicate,
+        params,
+    )
+    return int(cur.rowcount)
+
+
 # ---------------------------------------------------------------------------
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
@@ -3535,6 +3601,340 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class ExternalTaskSyncConflict(RuntimeError):
+    """Raised when external presentation state conflicts with owned execution."""
+
+
+def _normalise_external_status(status: str) -> str:
+    normalised = str(status or "").strip().lower().replace("_", "-")
+    if normalised not in EXTERNAL_PRESENTATION_TO_OPERATIONAL:
+        raise ValueError(
+            "presentation_status must be one of "
+            f"{sorted(EXTERNAL_PRESENTATION_TO_OPERATIONAL)}"
+        )
+    return normalised
+
+
+def _pid_is_alive(pid: Any, claim_lock: Any = None) -> bool:
+    if pid is None or not claim_lock:
+        return False
+    claim_host = str(claim_lock).rsplit(":", 1)[0]
+    local_host = _claimer_id().split(":", 1)[0]
+    if claim_host not in {local_host, local_host.split(".", 1)[0]}:
+        return False
+    return _pid_alive(int(pid))
+
+
+def _row_has_live_ownership(row: sqlite3.Row, *, now: Optional[int] = None) -> bool:
+    current = int(time.time()) if now is None else int(now)
+    claim_live = (
+        row["claim_lock"] is not None
+        and row["claim_expires"] is not None
+        and int(row["claim_expires"]) > current
+    )
+    return bool(
+        claim_live or _pid_is_alive(row["worker_pid"], row["claim_lock"])
+    )
+
+
+def _task_has_owned_open_run(conn: sqlite3.Connection, task_id: str) -> bool:
+    rows = conn.execute(
+        """
+        SELECT claim_lock, claim_expires, worker_pid
+          FROM task_runs
+         WHERE task_id = ? AND ended_at IS NULL
+        """,
+        (task_id,),
+    ).fetchall()
+    if any(_row_has_live_ownership(row) for row in rows):
+        return True
+    task_row = conn.execute(
+        "SELECT claim_lock, claim_expires, worker_pid FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return bool(task_row and _row_has_live_ownership(task_row))
+
+
+def _reconcile_external_active_runs(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[int]:
+    """Apply ownership precedence and return the sole owned open run, if any."""
+    rows = conn.execute(
+        """
+        SELECT id, claim_lock, claim_expires, worker_pid
+          FROM task_runs
+         WHERE task_id = ? AND ended_at IS NULL
+         ORDER BY id
+        """,
+        (task_id,),
+    ).fetchall()
+    owned: dict[int, tuple[Any, Any, Any]] = {
+        int(row["id"]): (
+            row["claim_lock"],
+            row["claim_expires"],
+            row["worker_pid"],
+        )
+        for row in rows
+        if _row_has_live_ownership(row)
+    }
+    task_row = conn.execute(
+        """
+        SELECT current_run_id, claim_lock, claim_expires, worker_pid
+          FROM tasks WHERE id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    if task_row and _row_has_live_ownership(task_row):
+        pointed_id = task_row["current_run_id"]
+        open_ids = {int(row["id"]) for row in rows}
+        if pointed_id is None or int(pointed_id) not in open_ids:
+            raise ExternalTaskSyncConflict(
+                f"task {task_id} has live task ownership but no open pointed run"
+            )
+        owned[int(pointed_id)] = (
+            task_row["claim_lock"],
+            task_row["claim_expires"],
+            task_row["worker_pid"],
+        )
+    if len(owned) > 1:
+        raise ExternalTaskSyncConflict(
+            f"task {task_id} has multiple owned open runs: "
+            + ", ".join(str(run_id) for run_id in sorted(owned))
+        )
+
+    now = int(time.time())
+    if owned:
+        authoritative_id, ownership = next(iter(owned.items()))
+        claim_lock, claim_expires, worker_pid = ownership
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET claim_lock = ?, claim_expires = ?, worker_pid = ?
+             WHERE id = ? AND ended_at IS NULL
+            """,
+            (claim_lock, claim_expires, worker_pid, authoritative_id),
+        )
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'superseded', outcome = 'superseded_active',
+                   summary = COALESCE(summary, 'superseded by owned active run'),
+                   ended_at = ?, claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE task_id = ? AND ended_at IS NULL AND id != ?
+            """,
+            (now, task_id, authoritative_id),
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+               SET current_run_id = ?, claim_lock = ?, claim_expires = ?,
+                   worker_pid = ?
+             WHERE id = ?
+            """,
+            (
+                authoritative_id,
+                claim_lock,
+                claim_expires,
+                worker_pid,
+                task_id,
+            ),
+        )
+        return authoritative_id
+
+    conn.execute(
+        """
+        UPDATE task_runs
+           SET status = 'superseded', outcome = 'presentation_orphan',
+               summary = COALESCE(summary, 'external presentation state had no owner'),
+               ended_at = ?, claim_lock = NULL, claim_expires = NULL,
+               worker_pid = NULL
+         WHERE task_id = ? AND ended_at IS NULL
+        """,
+        (now, task_id),
+    )
+    conn.execute(
+        """
+        UPDATE tasks
+           SET current_run_id = NULL, claim_lock = NULL,
+               claim_expires = NULL, worker_pid = NULL
+         WHERE id = ?
+        """,
+        (task_id,),
+    )
+    return None
+
+
+def sync_external_task(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    title: str,
+    body: Optional[str],
+    presentation_status: str,
+    source: str,
+    idempotency_key: Optional[str] = None,
+) -> ExternalTaskSyncResult:
+    """Mirror source-owned task content without inventing worker execution."""
+    if not task_id or not str(task_id).strip():
+        raise ValueError("task_id is required")
+    if not title or not str(title).strip():
+        raise ValueError("title is required")
+    if not source or not str(source).strip():
+        raise ValueError("source is required")
+
+    external_status = _normalise_external_status(presentation_status)
+    requested_status = EXTERNAL_PRESENTATION_TO_OPERATIONAL[external_status]
+    lifecycle_status = requested_status in {"blocked", "done", "archived"}
+    before = conn.execute(
+        "SELECT title, body, status, external_status, idempotency_key "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    created = before is None
+
+    if lifecycle_status and before is not None and _task_has_owned_open_run(conn, task_id):
+        raise ExternalTaskSyncConflict(
+            f"cannot apply external {external_status!r} while owned execution is active"
+        )
+
+    now = int(time.time())
+    owned_active_run_id: Optional[int] = None
+    if before is not None and not lifecycle_status:
+        with write_txn(conn):
+            owned_active_run_id = _reconcile_external_active_runs(conn, task_id)
+
+    if created:
+        initial_status = "ready" if lifecycle_status else requested_status
+        with write_txn(conn):
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, title, body, assignee, status, external_status,
+                    priority, created_by, created_at, workspace_kind,
+                    idempotency_key
+                ) VALUES (?, ?, ?, NULL, ?, ?, 0, ?, ?, 'scratch', ?)
+                """,
+                (
+                    task_id, title.strip(), body, initial_status,
+                    external_status, source, now, idempotency_key,
+                ),
+            )
+    elif lifecycle_status:
+        with write_txn(conn):
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET current_run_id = NULL,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL
+                 WHERE id = ?
+                """,
+                (task_id,),
+            )
+            _supersede_other_open_runs(conn, task_id, None, ended_at=now)
+            current_status = str(before["status"])
+            if requested_status in {"blocked", "done"} and current_status not in {
+                "running", "ready", "blocked"
+            }:
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+                    (task_id,),
+                )
+
+    if lifecycle_status:
+        current = get_task(conn, task_id)
+        if current is None:
+            raise RuntimeError(f"external task {task_id!r} disappeared during sync")
+        if requested_status == "done" and current.status != "done":
+            if not complete_task(
+                conn,
+                task_id,
+                result=f"Completed in external source: {source}",
+                summary=f"External source {source} marked the task done",
+                metadata={"external_source": source},
+                reject_owned_execution=True,
+            ):
+                raise ExternalTaskSyncConflict(
+                    f"external completion transition failed for {task_id}"
+                )
+        elif requested_status == "blocked" and current.status != "blocked":
+            if not block_task(
+                conn,
+                task_id,
+                reason=f"External source {source} marked the task blocked",
+                reject_owned_execution=True,
+            ):
+                raise ExternalTaskSyncConflict(
+                    f"external block transition failed for {task_id}"
+                )
+        elif requested_status == "archived" and current.status != "archived":
+            if not archive_task(
+                conn,
+                task_id,
+                reject_owned_execution=True,
+            ):
+                raise ExternalTaskSyncConflict(
+                    f"external archive transition failed for {task_id}"
+                )
+        operational_status = requested_status
+    else:
+        operational_status = (
+            "running" if owned_active_run_id is not None else requested_status
+        )
+
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT title, body, status, external_status, idempotency_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        changed = created or current is None or any(
+            (
+                current["title"] != title.strip(),
+                (current["body"] or "") != (body or ""),
+                current["status"] != operational_status,
+                current["external_status"] != external_status,
+                current["idempotency_key"] != idempotency_key,
+            )
+        )
+        if current is None:
+            raise RuntimeError(f"external task {task_id!r} disappeared during sync")
+        if changed:
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET title = ?, body = ?, status = ?, external_status = ?,
+                       idempotency_key = ?
+                 WHERE id = ?
+                """,
+                (
+                    title.strip(), body, operational_status, external_status,
+                    idempotency_key, task_id,
+                ),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "external_synced",
+                {
+                    "source": source,
+                    "presentation_status": external_status,
+                    "operational_status": operational_status,
+                    "created": created,
+                },
+            )
+
+    return ExternalTaskSyncResult(
+        created=created,
+        changed=changed,
+        operational_status=operational_status,
+        presentation_status=external_status,
+    )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3544,6 +3944,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    reject_owned_execution: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -3603,6 +4004,8 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
+        if reject_owned_execution and _task_has_owned_open_run(conn, task_id):
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -3642,6 +4045,7 @@ def complete_task(
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
+        _supersede_other_open_runs(conn, task_id, run_id, ended_at=now)
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
@@ -4026,9 +4430,12 @@ def block_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    reject_owned_execution: bool = False,
 ) -> bool:
     """Transition ``running -> blocked``."""
     with write_txn(conn):
+        if reject_owned_execution and _task_has_owned_open_run(conn, task_id):
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4063,6 +4470,7 @@ def block_task(
             outcome="blocked", status="blocked",
             summary=reason,
         )
+        _supersede_other_open_runs(conn, task_id, run_id)
         # Synthesize a run when blocking a never-claimed task so the
         # reason is preserved in attempt history.
         if run_id is None and reason:
@@ -4516,8 +4924,15 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reject_owned_execution: bool = False,
+) -> bool:
     with write_txn(conn):
+        if reject_owned_execution and _task_has_owned_open_run(conn, task_id):
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -4534,6 +4949,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
+        _supersede_other_open_runs(conn, task_id, run_id)
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
