@@ -3836,9 +3836,14 @@ def sync_external_task(
             )
             _supersede_other_open_runs(conn, task_id, None, ended_at=now)
             current_status = str(before["status"])
-            if requested_status in {"blocked", "done"} and current_status not in {
-                "running", "ready", "blocked"
-            }:
+            should_reset_for_terminal_transition = (
+                requested_status == "done"
+                and current_status not in {"running", "ready", "blocked", "done"}
+            ) or (
+                requested_status == "blocked"
+                and current_status not in {"running", "ready", "blocked"}
+            )
+            if should_reset_for_terminal_transition:
                 conn.execute(
                     "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
                     (task_id,),

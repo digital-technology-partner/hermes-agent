@@ -510,6 +510,42 @@ def test_external_sync_is_idempotent(kanban_home):
     assert after_events == before_events
 
 
+def test_repeated_external_done_sync_does_not_create_duplicate_terminal_run(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        first = kb.sync_external_task(
+            conn,
+            task_id="same-done",
+            title="Same done",
+            body="finished externally",
+            presentation_status="done",
+            source="test",
+            idempotency_key="external:same-done",
+        )
+        runs_after_first = kb.list_runs(conn, task_id="same-done")
+        events_after_first = kb.list_events(conn, "same-done")
+
+        second = kb.sync_external_task(
+            conn,
+            task_id="same-done",
+            title="Same done",
+            body="finished externally",
+            presentation_status="done",
+            source="test",
+            idempotency_key="external:same-done",
+        )
+        runs_after_second = kb.list_runs(conn, task_id="same-done")
+        events_after_second = kb.list_events(conn, "same-done")
+
+    assert first.changed is True
+    assert second.changed is False
+    assert len(runs_after_first) == 1
+    assert len(runs_after_second) == 1
+    assert runs_after_second[0].id == runs_after_first[0].id
+    assert len(events_after_second) == len(events_after_first)
+
+
 def test_completion_reconciles_every_open_run(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="reconcile")
