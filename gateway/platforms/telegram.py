@@ -2848,6 +2848,79 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_clarify failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_morning_brief_card(
+        self,
+        chat_id: str,
+        card,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send one Hudson morning-brief action card with inline buttons."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            from gateway.morning_brief_cards import CardStore, keyboard_spec, render_card_text
+
+            store = CardStore()
+            rows = keyboard_spec(card)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        button["text"],
+                        url=button.get("url"),
+                        callback_data=button.get("callback_data"),
+                    )
+                    for button in row
+                ]
+                for row in rows
+            ]) if rows else None
+
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=render_card_text(card),
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+                **self._notification_kwargs({**(metadata or {}), "notify": True}),
+            )
+            card.telegram_chat_id = str(chat_id)
+            card.telegram_message_id = str(msg.message_id)
+            store.upsert(card)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_morning_brief_card failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+    def _kick_morning_brief_action_worker(self) -> None:
+        """Start the morning-brief action worker without blocking Telegram callback handling."""
+        if os.getenv("HUDSON_MB_ACTION_WORKER_AUTOSTART", "1").strip().lower() in {"0", "false", "no"}:
+            logger.info("[%s] morning-brief action worker autostart disabled", self.name)
+            return
+        try:
+            import subprocess
+            from pathlib import Path as _P
+            script = _P.home() / ".hermes" / "scripts" / "morning_brief_cards.py"
+            python = _P.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
+            cmd = [str(python if python.exists() else sys.executable), str(script), "worker", "--once", "--notify"]
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            logger.info("[%s] kicked morning-brief action worker", self.name)
+        except Exception as exc:
+            logger.error("[%s] failed to kick morning-brief action worker: %s", self.name, exc, exc_info=True)
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -3244,8 +3317,22 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Morning-brief action-card callbacks (mb:card:action[:option]) ---
+        # Keep this before the model picker: the model picker uses bare "mb"
+        # for its Back button, but morning-brief cards use the "mb:" prefix.
+        if data.startswith("mb:"):
+            await self._handle_morning_brief_card_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Model picker callbacks ---
-        if data.startswith(("mp:", "mpg:", "mm:", "mb", "mx", "mg:")):
+        if data.startswith(("mp:", "mpg:", "mm:", "mx", "mg:")) or data == "mb":
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
@@ -3576,6 +3663,133 @@ class TelegramAdapter(BasePlatformAdapter):
                         answer, getattr(query.from_user, "id", "unknown"))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
+
+    async def _handle_morning_brief_card_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Dispatch a morning-brief action-card callback.
+
+        This is deliberately morning-brief specific for the MVP.  It uses the
+        shared Telegram inline-keyboard plumbing but keeps the card state and
+        write-back logic in ``gateway.morning_brief_cards`` rather than growing
+        a generic cross-channel framework too early.
+        """
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to act on this card.")
+            return
+
+        try:
+            from gateway.morning_brief_cards import (
+                CardWorkflowStore,
+                NON_TERMINAL_STATES,
+                TERMINAL_STATES,
+                apply_action,
+                keyboard_spec,
+                render_card_text,
+            )
+        except Exception as exc:
+            logger.error("[%s] morning-brief card module unavailable: %s", self.name, exc, exc_info=True)
+            await query.answer(text="❌ Card handler unavailable.")
+            return
+
+        user_display = getattr(query.from_user, "first_name", "User") or "User"
+        result = apply_action(data, user_display=user_display)
+        if not result.get("ok"):
+            await query.answer(text=f"❌ {str(result.get('error') or 'Action failed')[:180]}")
+            card = result.get("card")
+            if card is not None:
+                try:
+                    await query.edit_message_text(
+                        text=render_card_text(card),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=None,
+                    )
+                except Exception as exc:
+                    logger.error("[%s] morning-brief card failure edit failed: %s", self.name, exc, exc_info=True)
+            return
+
+        label = str(result.get("label") or "✓ Recorded")[:180]
+        if result.get("duplicate"):
+            await query.answer(text="Already recorded.")
+        else:
+            await query.answer(text=label)
+
+        card = result.get("card")
+        if card is None:
+            return
+        action_job = result.get("action_job") if isinstance(result.get("action_job"), dict) else None
+        if action_job and action_job.get("queued"):
+            kicker = getattr(self, "_kick_morning_brief_action_worker", None)
+            if callable(kicker):
+                kicker()
+        try:
+            rows = keyboard_spec(card)
+            reply_markup = None
+            if rows and card.state in NON_TERMINAL_STATES:
+                reply_markup = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            button["text"],
+                            url=button.get("url"),
+                            callback_data=button.get("callback_data"),
+                        )
+                        for button in row
+                    ]
+                    for row in rows
+                ])
+            await query.edit_message_text(
+                text=render_card_text(card),
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] morning-brief card mutation failed: card=%s err=%s",
+                self.name,
+                getattr(card, "interaction_id", "unknown"),
+                exc,
+                exc_info=True,
+            )
+
+        if not result.get("duplicate") and getattr(card, "state", None) in TERMINAL_STATES:
+            try:
+                workflow, next_card = CardWorkflowStore().advance_after_terminal_card(card.interaction_id)
+                if workflow and next_card:
+                    send_result = await self.send_morning_brief_card(
+                        str(workflow["chat_id"]),
+                        next_card,
+                        metadata={"thread_id": workflow.get("thread_id")} if workflow.get("thread_id") else None,
+                    )
+                    if not send_result.success:
+                        logger.error(
+                            "[%s] morning-brief workflow advance send failed: workflow=%s next_card=%s err=%s",
+                            self.name,
+                            workflow.get("workflow_id"),
+                            next_card.interaction_id,
+                            send_result.error,
+                        )
+            except Exception as exc:
+                logger.error(
+                    "[%s] morning-brief workflow advance failed: card=%s err=%s",
+                    self.name,
+                    getattr(card, "interaction_id", "unknown"),
+                    exc,
+                    exc_info=True,
+                )
 
     # Maps `gt:<verb>` -> (script-name, extra-args, success-label, is_state).
     # Scripts live in ~/.hermes/scripts/gmail-triage/. `arg` from the callback
