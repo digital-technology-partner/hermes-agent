@@ -341,6 +341,61 @@ def test_worker_blocks_unregistered_job_type(fixture_cards):
     assert "No handler is registered" in (job.result_summary or "")
 
 
+def test_task_closure_accept_tap_is_the_approval_and_archives_done_task(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    task = tmp_path / "vault" / "wiki" / "tasks" / "accepted-task.md"
+    task.parent.mkdir(parents=True)
+    task.write_text("""---
+title: Accepted task
+status: active
+updated: 2026-07-27
+kanban_status: done
+kanban_card_id: t_accepted
+steve_review_at: null
+archived_at: null
+---
+# Accepted task
+
+## Closeout
+
+- Ready for Steve review.
+""", encoding="utf-8")
+    card = build_cards_from_brief_items([{
+        "title": "Accept completed task?",
+        "item_key": "accept-completed-task",
+        "card_type": "approval",
+        "summary": "The acceptance test passed.",
+        "decision_prompt": "Accept and archive this task.",
+        "open_target": {"path": str(task), "kind": "task_note"},
+        "write_back_target": {"type": "task_note", "path": str(task), "section": "Morning brief decisions"},
+        "action_jobs": {"accept": {
+            "job_type": "task_closure",
+            "title": "Archive accepted task",
+            "input": {"run_sync": False},
+        }},
+    }], brief_date="2026-07-28")[0]
+    card_store = CardStore()
+    card_store.upsert(card)
+
+    result = apply_action(
+        callback_for(card.interaction_id, "accept"),
+        user_display="Steve",
+        store=card_store,
+        now="2026-07-28T06:05:36+00:00",
+    )
+    assert result["action_job"]["queued"] is True
+
+    job = run_next_action_job(store=ActionJobStore())
+    assert job is not None
+    assert job.status == "succeeded"
+    text = task.read_text(encoding="utf-8")
+    assert "status: archived" in text
+    assert "kanban_status: archived" in text
+    assert "steve_review_at: 2026-07-28T06:05:36+00:00" in text
+    assert "archived_at: 2026-07-28T06:05:36+00:00" in text
+    assert "Steve accepted completion through Telegram morning-brief card" in text
+    assert "I need approval before continuing" not in (render_action_job_result_message(job) or "")
+
 
 def test_prepare_duplicate_task_node_cleanup_plan_handler(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

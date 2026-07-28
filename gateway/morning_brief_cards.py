@@ -957,6 +957,104 @@ def _section_text(text: str, heading: str) -> str:
     return text[start:end].strip()
 
 
+def _replace_frontmatter_value(text: str, key: str, value: str) -> str:
+    """Replace one existing YAML frontmatter scalar without touching the body."""
+    if not text.startswith("---\n"):
+        raise ValueError("task note has no YAML frontmatter")
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        raise ValueError("task note has unterminated YAML frontmatter")
+    frontmatter = text[4:end]
+    pattern = re.compile(rf"^{re.escape(key)}:\s*.*$", flags=re.MULTILINE)
+    replacement = f"{key}: {value}"
+    if pattern.search(frontmatter):
+        frontmatter = pattern.sub(replacement, frontmatter, count=1)
+    else:
+        frontmatter = frontmatter.rstrip("\n") + "\n" + replacement
+    return "---\n" + frontmatter + text[end:]
+
+
+def _handler_task_closure(job: ActionJob) -> Dict[str, Any]:
+    """Archive a done DTP task after Steve accepts it on its Telegram card.
+
+    The terminal ``accept``/``done`` tap is the approval for this exact bounded
+    action.  The handler must not manufacture a second approval gate.
+    """
+    path = _job_write_back_path(job)
+    if not path:
+        return {"status": "failed", "summary": "No task path was configured.", "error": "missing write-back target"}
+    reason = _validate_worker_path(path, job)
+    if reason:
+        return {"status": "failed", "summary": reason, "error": reason}
+    if path.parent.name != "tasks" or path.parent.parent.name != "wiki":
+        return {"status": "failed", "summary": "Task closure target is not under wiki/tasks.", "error": str(path)}
+    if not path.exists() or not path.is_file():
+        return {"status": "failed", "summary": f"Task note is missing: {path}", "error": str(path)}
+    if job.trigger_action not in {"accept", "done"} or job.trigger_state != "accepted":
+        return {
+            "status": "failed",
+            "summary": "Task closure requires a terminal Accept/Done card action.",
+            "error": f"trigger={job.trigger_action} state={job.trigger_state}",
+        }
+
+    text = path.read_text(encoding="utf-8")
+    lane = _frontmatter_value(text, "kanban_status")
+    status = _frontmatter_value(text, "status")
+    if status == "archived" and lane == "archived":
+        return {"status": "succeeded", "summary": "Task was already archived from an accepted review.", "result_paths": [str(path)]}
+    if lane != "done":
+        return {
+            "status": "failed",
+            "summary": f"Task is in `{lane or 'unknown'}`, not `done`; it was not archived.",
+            "error": "source task is not awaiting acceptance",
+        }
+
+    accepted_at = job.created_at or utc_now_iso()
+    updated_date = accepted_at[:10]
+    for key, value in (
+        ("status", "archived"),
+        ("kanban_status", "archived"),
+        ("updated", updated_date),
+        ("steve_review_at", accepted_at),
+        ("archived_at", accepted_at),
+    ):
+        text = _replace_frontmatter_value(text, key, value)
+    path.write_text(text, encoding="utf-8")
+    _append_markdown_section(
+        path,
+        "Closeout",
+        [f"- {accepted_at} — Steve accepted completion through Telegram morning-brief card `{job.source_card_id}`; task archived."],
+    )
+
+    sync_summary = "task archived; sync/preflight not requested"
+    if bool(job.input.get("run_sync", True)):
+        import subprocess
+        py = Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
+        script = Path.home() / ".hermes" / "scripts" / "dtp_task_management.py"
+        proc = subprocess.run([str(py), str(script), "preflight"], text=True, capture_output=True, timeout=120)
+        if proc.returncode != 0:
+            return {
+                "status": "failed",
+                "summary": f"Task was archived, but task preflight failed with exit {proc.returncode}.",
+                "error": (proc.stderr or proc.stdout)[-1000:],
+                "result_paths": [str(path)],
+            }
+        try:
+            parsed = json.loads(proc.stdout)
+            sync = parsed.get("sync", {}) if isinstance(parsed, dict) else {}
+            sync_summary = (
+                f"preflight ok={sync.get('ok')} conflicts={sync.get('conflicts')} "
+                f"updated_kanban={sync.get('updated_kanban')} updated_wiki={sync.get('updated_wiki')}"
+            )
+        except Exception:
+            sync_summary = "preflight completed but JSON could not be parsed"
+    return {
+        "status": "succeeded",
+        "summary": f"Archived the accepted task and verified {sync_summary}.",
+        "result_paths": [str(path)],
+    }
+
+
 def _handler_prepare_duplicate_task_node_cleanup_plan(job: ActionJob) -> Dict[str, Any]:
     canonical_raw = job.input.get("canonical_path")
     duplicate_raw = job.input.get("duplicate_path")
@@ -1086,6 +1184,7 @@ def _handler_apply_duplicate_task_node_cleanup(job: ActionJob) -> Dict[str, Any]
 
 
 ACTION_JOB_HANDLERS = {
+    "task_closure": _handler_task_closure,
     "apply_duplicate_task_node_cleanup": _handler_apply_duplicate_task_node_cleanup,
     "prepare_duplicate_task_node_cleanup_plan": _handler_prepare_duplicate_task_node_cleanup_plan,
     "cleanup_task_sync_conflict": _handler_cleanup_task_sync_conflict,
